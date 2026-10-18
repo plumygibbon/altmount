@@ -369,6 +369,8 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	api.Post("/stremio/useragents/refresh", s.handleRefreshStremioUserAgents)
 	api.Post("/stremio/search/inspect", s.handleInspectStremioSearch)
 	api.Post("/stremio/scoring/evaluate", s.handleEvaluateStremioRelease)
+	api.Get("/stremio/display/presets", s.handleGetStremioDisplayPresets)
+	api.Post("/stremio/display/preview", s.handleStremioDisplayPreview)
 
 	// FUSE endpoints
 	api.Post("/fuse/start", s.handleStartFuseMount)
