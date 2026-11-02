@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -124,6 +125,18 @@ type Par2RepairConfig struct {
 	// scratch files) are stored. Empty (default) means <metadata_root>/patches.
 	// Applied at startup; changing it does not move existing patches.
 	PatchDir string `yaml:"patch_dir" mapstructure:"patch_dir" json:"patch_dir,omitempty"`
+	// ReadFailureAction is what a stream does when it hits a bad article: "" keeps
+	// the default (zero-fill small gaps and repair in the background, replace on
+	// a CRC failure), "replace" fetches a new release straight away, and
+	// "repair_first" holds the read while PAR2 repairs if the player is far enough
+	// behind, replacing otherwise.
+	ReadFailureAction string `yaml:"read_failure_action,omitempty" mapstructure:"read_failure_action" json:"read_failure_action,omitempty"`
+	// ReadFailureMinLeadMB is how far ahead of where the stream started the bad
+	// article must be for repair_first to try. 0 (default) means 1024.
+	ReadFailureMinLeadMB int `yaml:"read_failure_min_lead_mb,omitempty" mapstructure:"read_failure_min_lead_mb" json:"read_failure_min_lead_mb,omitempty"`
+	// ReadFailureMaxWaitSeconds is how long repair_first holds a read before
+	// cancelling the repair and replacing the file. 0 (default) means 300.
+	ReadFailureMaxWaitSeconds int `yaml:"read_failure_max_wait_seconds,omitempty" mapstructure:"read_failure_max_wait_seconds" json:"read_failure_max_wait_seconds,omitempty"`
 	// ArrFirst makes PAR2 repair the fallback for corrupted files: the health
 	// worker triggers the ARR rescan first exactly as before, and enqueues a
 	// PAR2 repair only when nothing is found in the ARRs (no instance
@@ -157,6 +170,68 @@ func (p Par2RepairConfig) EffectivePatchDir(metadataRoot string) string {
 		return p.PatchDir
 	}
 	return filepath.Join(metadataRoot, "patches")
+}
+
+// Values for Par2RepairConfig.ReadFailureAction.
+const (
+	ReadFailureDefault     = "default"
+	ReadFailureReplace     = "replace"
+	ReadFailureRepairFirst = "repair_first"
+)
+
+// EffectiveReadFailureAction returns the configured action, with empty or
+// unknown values meaning the default.
+func (p Par2RepairConfig) EffectiveReadFailureAction() string {
+	switch p.ReadFailureAction {
+	case ReadFailureReplace, ReadFailureRepairFirst:
+		return p.ReadFailureAction
+	}
+	return ReadFailureDefault
+}
+
+// EffectiveReadFailureMinLeadBytes returns the minimum lead for repair_first.
+func (p Par2RepairConfig) EffectiveReadFailureMinLeadBytes() int64 {
+	if p.ReadFailureMinLeadMB <= 0 {
+		return 1024 << 20
+	}
+	return int64(p.ReadFailureMinLeadMB) << 20
+}
+
+// EffectiveReadFailureMaxWait returns how long repair_first holds a read.
+func (p Par2RepairConfig) EffectiveReadFailureMaxWait() time.Duration {
+	if p.ReadFailureMaxWaitSeconds <= 0 {
+		return 5 * time.Minute
+	}
+	return time.Duration(p.ReadFailureMaxWaitSeconds) * time.Second
+}
+
+// ReadAheadBytes parses vfs_read_ahead (rclone size syntax such as 1G or 512M).
+// It returns 0 when unset or unparsable.
+func (r RCloneConfig) ReadAheadBytes() int64 {
+	return parseRcloneSize(r.VFSReadAhead)
+}
+
+func parseRcloneSize(value string) int64 {
+	s := strings.ToUpper(strings.TrimSpace(value))
+	s = strings.TrimSuffix(strings.TrimSuffix(s, "B"), "I")
+	mult := int64(1 << 10) // rclone reads a bare number as KiB
+	if s != "" {
+		switch s[len(s)-1] {
+		case 'K':
+			s = s[:len(s)-1]
+		case 'M':
+			mult, s = 1<<20, s[:len(s)-1]
+		case 'G':
+			mult, s = 1<<30, s[:len(s)-1]
+		case 'T':
+			mult, s = 1<<40, s[:len(s)-1]
+		}
+	}
+	n, err := strconv.ParseFloat(s, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return int64(n * float64(mult))
 }
 
 // EffectiveArrFirst reports whether corrupted files fall back to PAR2 repair
@@ -1199,6 +1274,18 @@ func (c *Config) GetDownloadClientBaseURL() string {
 
 // Validate validates the configuration
 func (c *Config) Validate() error {
+	switch c.Par2Repair.ReadFailureAction {
+	case "", ReadFailureDefault, ReadFailureReplace, ReadFailureRepairFirst:
+	default:
+		return fmt.Errorf("par2_repair read_failure_action must be default, replace or repair_first")
+	}
+	if c.Par2Repair.ReadFailureMinLeadMB < 0 {
+		return fmt.Errorf("par2_repair read_failure_min_lead_mb cannot be negative")
+	}
+	if c.Par2Repair.ReadFailureMaxWaitSeconds < 0 {
+		return fmt.Errorf("par2_repair read_failure_max_wait_seconds cannot be negative")
+	}
+
 	if c.WebDAV.Port <= 0 || c.WebDAV.Port > 65535 {
 		return fmt.Errorf("webdav port must be between 1 and 65535")
 	}

@@ -1,10 +1,12 @@
 package nzbfilesystem
 
 import (
+	"context"
 	"log/slog"
 	"strings"
 	"time"
 
+	"github.com/kipsilabs/altmount/internal/config"
 	"github.com/kipsilabs/altmount/internal/holes"
 	"github.com/kipsilabs/altmount/internal/metadata"
 	metapb "github.com/kipsilabs/altmount/internal/metadata/proto"
@@ -54,6 +56,10 @@ type PatchSource interface {
 // PAR2 job serve byte-exact.
 func (mvf *MetadataVirtualFile) holeHooks() *usenet.HoleHooks {
 	mvf.holeOnce.Do(func() {
+		if mvf.readFailureHandled() {
+			mvf.holeHooksVal = mvf.readFailureHooks()
+			return
+		}
 		if !mvf.holeEligible() {
 			if mvf.patchSource != nil {
 				mvf.holeHooksVal = &usenet.HoleHooks{PatchLookup: mvf.patchLookup}
@@ -205,4 +211,50 @@ func paddedRatio(total int, segBytes, fileSize int64) float64 {
 		return 0
 	}
 	return float64(int64(total)*segBytes) / float64(fileSize)
+}
+
+// readFailureHandled reports whether par2_repair.read_failure_action takes over
+// this file's failed reads from the zero-fill path.
+func (mvf *MetadataVirtualFile) readFailureHandled() bool {
+	if mvf.repairHolds == nil || mvf.configGetter == nil || !mvf.holeEligible() {
+		return false
+	}
+	return mvf.configGetter().Par2Repair.EffectiveReadFailureAction() != config.ReadFailureDefault
+}
+
+// readFailureHooks builds hooks that send every failed article to repairHolds.
+// There is no zero-fill: bytes faked here could stay in rclone's cache even after
+// a good repair. Everything they use is captured now, because they run on detached
+// goroutines after Close may have cleared mvf.meta.
+func (mvf *MetadataVirtualFile) readFailureHooks() *usenet.HoleHooks {
+	offsets := buildSegmentIndex(mvf.meta.SegmentData)
+	name := mvf.name
+	source := mvf.meta.SourceNzbPath
+	fromRclone := mvf.fromRclone
+	holds := mvf.repairHolds
+	hooks := &usenet.HoleHooks{
+		OnFailure: func(ctx context.Context, segIndex int, segID string, cause error) bool {
+			mvf.holdingRepair.Add(1)
+			defer mvf.holdingRepair.Add(-1)
+			return holds.handle(ctx, failedRead{
+				name:          name,
+				segmentID:     segID,
+				offset:        offsets.getOffsetForSegment(segIndex),
+				rcloneClient:  fromRclone,
+				cause:         cause.Error(),
+				sourceNzbPath: source,
+			})
+		},
+	}
+	if mvf.patchSource != nil {
+		hooks.PatchLookup = mvf.patchLookup
+	}
+	return hooks
+}
+
+// noteReadForHold tracks where this stream is reading, for repair_first's lead.
+func (mvf *MetadataVirtualFile) noteReadForHold(offset int64) {
+	if mvf.repairHolds != nil && mvf.fromRclone {
+		mvf.repairHolds.noteRead(mvf.name, offset)
+	}
 }

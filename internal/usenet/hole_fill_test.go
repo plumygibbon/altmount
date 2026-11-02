@@ -221,3 +221,142 @@ func TestReaderPlaceholderSegmentZeroFillsWithNilHooks(t *testing.T) {
 		}
 	}
 }
+
+// failThenServe answers its article with CRC-bad bytes, as a corrupt article
+// streams its body before the checksum fails.
+type failThenServe struct {
+	*fakepool.Client
+	id   string
+	body []byte
+}
+
+func (f *failThenServe) Fetch(ctx context.Context, r nntppool.Req) (*nntppool.ArticleBody, error) {
+	if r.MessageID == f.id {
+		if r.Writer != nil {
+			_, _ = r.Writer.Write(f.body)
+		}
+		return &nntppool.ArticleBody{}, nntppool.ErrCRCMismatch
+	}
+	return f.Client.Fetch(ctx, r)
+}
+
+func newHookedReader(t *testing.T, ctx context.Context, client pool.NntpClient, rg *segmentRange, hooks *HoleHooks) *UsenetReader {
+	t.Helper()
+	getter := func() (pool.NntpClient, error) { return client, nil }
+	ur, err := NewUsenetReader(ctx, getter, rg, 4, noopMetrics{}, "test-stream", nil, WithHoleHooks(hooks))
+	if err != nil {
+		t.Fatalf("NewUsenetReader: %v", err)
+	}
+	t.Cleanup(func() { _ = ur.Close() })
+	return ur
+}
+
+// A held read gets the repaired bytes, in place, with no error.
+func TestReaderOnFailureServesRepairedArticle(t *testing.T) {
+	ctx := context.Background()
+	const n, segSize = 6, 4
+	fp := fillFakePool(n, segSize)
+	fp.SetBehavior(segments.MessageID(2), fakepool.SegmentBehavior{Err: nntppool.ErrArticleNotFound})
+	repaired := bytes.Repeat([]byte{3}, segSize)
+
+	var patched atomic.Bool
+	var failures atomic.Int32
+	release := make(chan struct{})
+	hooks := &HoleHooks{
+		OnFailure: func(ctx context.Context, segIndex int, segID string, cause error) bool {
+			failures.Add(1)
+			if segIndex != 2 || !errors.Is(cause, nntppool.ErrArticleNotFound) {
+				t.Errorf("failure for segment %d: %v", segIndex, cause)
+			}
+			<-release
+			patched.Store(true)
+			return true
+		},
+		PatchLookup: func(segID string) []byte {
+			if patched.Load() && segID == segments.MessageID(2) {
+				return repaired
+			}
+			return nil
+		},
+	}
+	close(release)
+	ur := newHookedReader(t, ctx, fp, buildEagerRange(ctx, t, n, segSize), hooks)
+	got, err := io.ReadAll(ur)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var want []byte
+	for i := range n {
+		want = append(want, bytes.Repeat([]byte{byte(i + 1)}, segSize)...)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if failures.Load() != 1 {
+		t.Fatalf("failures = %d, want 1", failures.Load())
+	}
+}
+
+// Refusing to repair fails the read, and doesn't zero-fill.
+func TestReaderOnFailureRefusalFailsTheRead(t *testing.T) {
+	ctx := context.Background()
+	const n, segSize = 4, 4
+	fp := fillFakePool(n, segSize)
+	fp.SetBehavior(segments.MessageID(1), fakepool.SegmentBehavior{Err: nntppool.ErrArticleNotFound})
+	hooks := &HoleHooks{
+		OnFailure: func(context.Context, int, string, error) bool { return false },
+		OnHole: func(int, string) holes.Decision {
+			t.Error("OnHole must not run when OnFailure is set")
+			return holes.DecisionPad
+		},
+	}
+	ur := newHookedReader(t, ctx, fp, buildEagerRange(ctx, t, n, segSize), hooks)
+	got, err := io.ReadAll(ur)
+	if err == nil {
+		t.Fatal("want a read error")
+	}
+	if len(got) != segSize {
+		t.Fatalf("read %d bytes before failing, want %d", len(got), segSize)
+	}
+}
+
+// A CRC-bad body must not reach the reader ahead of its verdict, and the failure
+// must reach the handler even though it isn't a missing article.
+func TestReaderOnFailureHoldsBackCorruptBytes(t *testing.T) {
+	ctx := context.Background()
+	const n, segSize = 3, 4
+	fp := fillFakePool(n, segSize)
+	bad := segments.MessageID(1)
+	client := &failThenServe{Client: fp, id: bad, body: []byte{0xBA, 0xD0, 0xBA, 0xD0}}
+	good := bytes.Repeat([]byte{2}, segSize)
+
+	var gotCorruption atomic.Bool
+	var patched atomic.Bool
+	hooks := &HoleHooks{
+		OnFailure: func(_ context.Context, _ int, segID string, cause error) bool {
+			gotCorruption.Store(errors.Is(cause, nntppool.ErrCRCMismatch))
+			patched.Store(true)
+			return true
+		},
+		PatchLookup: func(segID string) []byte {
+			if patched.Load() && segID == bad {
+				return good
+			}
+			return nil
+		},
+	}
+	ur := newHookedReader(t, ctx, client, buildEagerRange(ctx, t, n, segSize), hooks)
+	got, err := io.ReadAll(ur)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if bytes.Contains(got, []byte{0xBA, 0xD0}) {
+		t.Fatalf("corrupt bytes reached the reader: %v", got)
+	}
+	if !gotCorruption.Load() {
+		t.Fatal("OnFailure did not see the CRC failure")
+	}
+	if !bytes.Equal(got[segSize:2*segSize], good) {
+		t.Fatalf("got %v, want the repaired article", got)
+	}
+}

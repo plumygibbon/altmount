@@ -46,6 +46,9 @@ export interface Par2RepairConfig {
 	patch_dir?: string; // where patches + solver scratch live; empty = <metadata_root>/patches
 	arr_first?: boolean; // corrupted files: ARR repair first, PAR2 as fallback when the ARRs come up empty (default true)
 	repair_on_import?: boolean; // queue a repair as soon as a damaged file imports
+	read_failure_action?: "default" | "replace" | "repair_first"; // what a stream does when it hits a bad article
+	read_failure_min_lead_mb?: number; // repair_first: how far ahead of the stream's start the bad article must be
+	read_failure_max_wait_seconds?: number; // repair_first: how long to hold a read before replacing
 }
 
 // WebDAV server configuration

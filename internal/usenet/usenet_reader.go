@@ -54,6 +54,11 @@ type HoleHooks struct {
 	// KnownHoles reports segments already known missing: those are
 	// zero-filled immediately, without any fetch (replay pre-pad).
 	KnownHoles func(segIndex int) bool
+	// OnFailure, when set, takes over any segment that failed for good, missing
+	// or corrupt, instead of OnHole. Unlike the others it may block for as long
+	// as ctx lives: the reader waits, which is how a read is held for a repair.
+	// Returning true means PatchLookup now has the segment's payload.
+	OnFailure func(ctx context.Context, segIndex int, segID string, cause error) bool
 	// PatchLookup returns the repaired payload for a missing segment, or nil.
 	// Consulted only on the hole path (known hole, or confirmed missing on
 	// every provider) — never on healthy reads. Must be fast local I/O and
@@ -265,6 +270,16 @@ func isCorruptionError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "data corruption detected") ||
 		strings.Contains(msg, "crc mismatch")
+}
+
+// isArticleFailure reports whether err is the article itself being bad, rather
+// than the read being cancelled or the pool being unwell.
+func isArticleFailure(err error) bool {
+	if errors.Is(err, nntppool.ErrArticleNotFound) {
+		return true
+	}
+	var corrupt *DataCorruptionError
+	return errors.As(err, &corrupt)
 }
 
 type UsenetReader struct {
@@ -1092,6 +1107,16 @@ func (b *UsenetReader) downloadManager(ctx context.Context) {
 			data, err := b.downloadSegmentWithRetry(taskCtx, s, segIdx, keepOnClose)
 
 			if err != nil {
+				if b.holeHooks != nil && b.holeHooks.OnFailure != nil && isArticleFailure(err) {
+					if b.holeHooks.OnFailure(taskCtx, s.loaderIdx, s.Id, err) {
+						if p := b.patchFor(taskCtx, s); p != nil {
+							s.SetData(p)
+							return
+						}
+					}
+					s.SetError(err)
+					return
+				}
 				if errors.Is(err, nntppool.ErrArticleNotFound) {
 					// A confirmed-missing article may be zero-filled instead
 					// of failing the stream, when the owner's hole hook

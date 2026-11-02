@@ -69,6 +69,7 @@ type MetadataRemoteFile struct {
 	padRecorder      *padRecorder             // Process-lived worker persisting degraded-pad events
 	patchSource      PatchSource              // Repaired-article payloads (nil = PAR2 repair disabled)
 	repairEnqueuer   RepairEnqueuer           // Queues PAR2 repairs (nil = PAR2 repair disabled)
+	repairHolds      *repairHolds             // Applies par2_repair.read_failure_action
 	renameMu         sync.Mutex               // Mutex to protect rename operations from race conditions
 	deleteGuard      deleteGuard
 }
@@ -77,6 +78,7 @@ type MetadataRemoteFile struct {
 // during boot, before the filesystem serves reads.
 func (mrf *MetadataRemoteFile) SetPatchSource(ps PatchSource) {
 	mrf.patchSource = ps
+	mrf.rebuildRepairHolds()
 }
 
 // SetRepairEnqueuer wires the PAR2 repair queue into both playback triggers:
@@ -85,6 +87,19 @@ func (mrf *MetadataRemoteFile) SetPatchSource(ps PatchSource) {
 func (mrf *MetadataRemoteFile) SetRepairEnqueuer(re RepairEnqueuer) {
 	mrf.repairEnqueuer = re
 	mrf.padRecorder.repair = re
+	mrf.rebuildRepairHolds()
+}
+
+func (mrf *MetadataRemoteFile) rebuildRepairHolds() {
+	var repairs RepairActions
+	if actions, ok := mrf.repairEnqueuer.(RepairActions); ok {
+		repairs = actions
+	}
+	if mrf.healthRepository == nil || mrf.metadataService == nil || mrf.configGetter == nil {
+		mrf.repairHolds = nil
+		return
+	}
+	mrf.repairHolds = newRepairHolds(repairs, mrf.patchSource, mrf.healthRepository, mrf.metadataService, mrf.repairCoalescer, mrf.configGetter)
 }
 
 // Configuration is now accessed dynamically through config.ConfigGetter
@@ -317,6 +332,8 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 		padRecorder:      mrf.padRecorder,
 		patchSource:      mrf.patchSource,
 		repairEnqueuer:   mrf.repairEnqueuer,
+		repairHolds:      mrf.repairHolds,
+		fromRclone:       isRcloneClient(ctx),
 		configGetter:     mrf.configGetter,
 		poolManager:      mrf.poolManager,
 		ctx:              fileCtx,
@@ -894,6 +911,9 @@ type MetadataVirtualFile struct {
 	padRecorder      *padRecorder             // Persists degraded-pad events; may be nil in tests
 	patchSource      PatchSource              // Repaired-article payloads; may be nil
 	repairEnqueuer   RepairEnqueuer           // Queues PAR2 repairs; may be nil
+	repairHolds      *repairHolds             // Applies read_failure_action; may be nil
+	fromRclone       bool                     // Serving a request from rclone
+	holdingRepair    atomic.Int32             // Reads currently held for a repair
 	configGetter     config.ConfigGetter
 	poolManager      pool.Manager // Pool manager for dynamic pool access
 	ctx              context.Context
@@ -1090,13 +1110,21 @@ func (mvf *MetadataVirtualFile) armReadTimeout(parent context.Context) (ctx cont
 	ctx, cancel := context.WithTimeout(parent, timeout)
 
 	var interrupted atomic.Bool
-	timer := time.AfterFunc(timeout, func() {
+	var timer atomic.Pointer[time.Timer]
+	var fire func()
+	fire = func() {
+		// A read held for a repair is waiting on purpose, with its own deadline.
+		if mvf.holdingRepair.Load() > 0 {
+			timer.Store(time.AfterFunc(timeout, fire))
+			return
+		}
 		interrupted.Store(true)
 		slog.WarnContext(mvf.ctx, "Read exceeded the streaming read timeout, interrupting reader",
 			"path", mvf.name,
 			"timeout", timeout)
 		mvf.interruptCurrentReader()
-	})
+	}
+	timer.Store(time.AfterFunc(timeout, fire))
 
 	// Checking ctx.Err() rather than only the timer flag keeps this
 	// deterministic: the context package sets DeadlineExceeded before it
@@ -1107,7 +1135,7 @@ func (mvf *MetadataVirtualFile) armReadTimeout(parent context.Context) (ctx cont
 	}
 
 	return ctx, timedOut, func() {
-		timer.Stop()
+		timer.Load().Stop()
 		cancel()
 	}
 }
@@ -1251,6 +1279,7 @@ func (mvf *MetadataVirtualFile) Read(p []byte) (n int, err error) {
 	// Same watchdog as ReadAtContext — a stalled fetch parks a WebDAV/rclone
 	// read just as indefinitely as a FUSE one. Read has no context to thread
 	// through, so only the interrupt half applies here.
+	mvf.noteReadForHold(mvf.position)
 	_, timedOut, stopTimeout := mvf.armReadTimeout(mvf.readContext())
 	defer func() {
 		stopTimeout()
@@ -1345,6 +1374,7 @@ func (mvf *MetadataVirtualFile) ReadAtContext(readCtx context.Context, p []byte,
 	// read on the same handle. A single stuck read otherwise blocks every
 	// subsequent read on this file; interrupting the in-flight reader from here
 	// breaks that jam.
+	mvf.noteReadForHold(off)
 	readCtx, timedOut, stopTimeout := mvf.armReadTimeout(readCtx)
 	defer func() {
 		stopTimeout()

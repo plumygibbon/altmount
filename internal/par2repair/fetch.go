@@ -388,6 +388,11 @@ func (p *PoolFetcher) fetchOnce(ctx context.Context, messageID string) ([]byte, 
 		Lane:        nntppool.LaneBackground,
 		ArticleDate: p.articleDate,
 	})
+	if errors.Is(err, nntppool.ErrCRCMismatch) {
+		// The article arrived and is bad, and asking again won't change that.
+		// To a repair it's the same as gone: a slice to rebuild.
+		return nil, fmt.Errorf("par2repair: %w: article %s failed its yEnc CRC", nntppool.ErrArticleNotFound, messageID)
+	}
 	if err != nil {
 		return nil, err
 	}

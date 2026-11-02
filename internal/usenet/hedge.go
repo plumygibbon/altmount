@@ -132,7 +132,11 @@ func (b *UsenetReader) streamArticle(ctx context.Context, cp pool.NntpClient, se
 	}
 
 	start := time.Now()
+	// With a failure handler, bad bytes must not get out ahead of the verdict:
+	// the handler may repair the article, and they could outlive that downstream.
+	verifyFirst := b.holeHooks != nil && b.holeHooks.OnFailure != nil
 	primary := art.attemptWriter()
+	primary.verifyFirst = verifyFirst
 	run(primary)
 	pending := 1
 
@@ -187,7 +191,9 @@ func (b *UsenetReader) streamArticle(ctx context.Context, cp pool.NntpClient, se
 			b.log.DebugContext(ctx, "hedging slow demand article fetch",
 				"segment_id", seg.Id,
 				"elapsed", time.Since(start))
-			run(art.hedgeWriter(primary))
+			second := art.hedgeWriter(primary)
+			second.verifyFirst = verifyFirst
+			run(second)
 			pending++
 		}
 	}

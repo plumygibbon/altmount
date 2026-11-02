@@ -38,6 +38,34 @@ The Health page lists recent repair jobs with live sweep progress, an estimated 
 
 Repaired payloads live under `<metadata_root>/patches/`. They can be deleted at any time. After a successful repair the file's health status flips back to healthy.
 
+## When a read fails
+
+`read_failure_action` decides what a stream does when it hits a bad article.
+
+```yaml
+par2_repair:
+  read_failure_action: default       # default | replace | repair_first
+  read_failure_min_lead_mb: 1024     # repair_first: minimum distance ahead of the stream's start
+  read_failure_max_wait_seconds: 300 # repair_first: how long to hold a read before replacing
+```
+
+- **`default`** — missing articles within the padding limits are zero-filled while PAR2 repairs in the background. Corrupt articles fetch a new release.
+- **`replace`** — fetch a new release straight away. There is no zero-fill, so the stream stops and playback needs restarting once the new release has imported.
+- **`repair_first`** — hold the read while PAR2 repairs the bad article. The same file and handle stay in place, and the read carries on with byte-exact data, so a player far enough behind never notices. The file is replaced instead when:
+  - the bad article is closer than `read_failure_min_lead_mb` to where the stream started;
+  - the repair fails, or isn't finished within `read_failure_max_wait_seconds`;
+  - the read didn't come through the built-in rclone mount with `vfs_cache_mode: full`, as nothing else gives a player any lead.
+
+These only cover plain video files. Encrypted and nested releases keep today's behaviour.
+
+### Choosing the lead
+
+AltMount can't see the player, only rclone's requests, so it estimates the lead as the distance from where the stream started, capped at `vfs_read_ahead`. Keep `read_failure_min_lead_mb` at or below your read-ahead, or a repair will never start. A larger read-ahead gives a repair more time, at the cost of cache space.
+
+The estimate errs low. A partly cached file can be replaced even when there was time to repair, because AltMount only hears about the part rclone doesn't have. That costs a replacement, not a stalled player.
+
+If the player does catch up with a held read, it buffers until the repair finishes or `read_failure_max_wait_seconds` passes. Some players may give up sooner, in which case pressing play again picks up the repaired file.
+
 ## API
 
 List recent repair jobs:

@@ -35,7 +35,29 @@ const defaults: Par2RepairConfig = {
 	patch_dir: "",
 	arr_first: true,
 	repair_on_import: false,
+	read_failure_action: "default",
+	read_failure_min_lead_mb: 1024,
+	read_failure_max_wait_seconds: 300,
 };
+
+type ReadFailureAction = NonNullable<Par2RepairConfig["read_failure_action"]>;
+
+const readFailureDescriptions: Record<ReadFailureAction, string> = {
+	default:
+		"Missing articles: small gaps play as silence or a glitch while PAR2 repairs in the background. Corrupt articles: fetch a new release.",
+	replace:
+		"Fetch a new release straight away. The stream stops, and you'll need to press play again once the new release has imported.",
+	repair_first:
+		"Hold the read while PAR2 repairs the bad article, so playback can carry on as if nothing happened. If the player is too close, or the repair fails or takes too long, fetch a new release.",
+};
+
+// rcloneSizeToMb reads an rclone size such as 1G or 512M. Null when unparsable.
+function rcloneSizeToMb(size: string | undefined): number | null {
+	const match = /^\s*(\d+(?:\.\d+)?)\s*([KMGT])?(?:I?B)?\s*$/i.exec(size ?? "");
+	if (!match) return null;
+	const multipliers: Record<string, number> = { K: 1 / 1024, M: 1, G: 1024, T: 1024 * 1024 };
+	return Number(match[1]) * multipliers[(match[2] ?? "K").toUpperCase()];
+}
 
 export function Par2RepairConfigSection({
 	config,
@@ -56,6 +78,12 @@ export function Par2RepairConfigSection({
 		setData(next);
 		setHasChanges(JSON.stringify(next) !== JSON.stringify({ ...defaults, ...config.par2_repair }));
 	};
+
+	const repairFirst = data.read_failure_action === "repair_first";
+	const readAheadMb = rcloneSizeToMb(config.rclone?.vfs_read_ahead);
+	const minLeadMb = data.read_failure_min_lead_mb ?? 1024;
+	const rcloneFullCache =
+		config.mount_type === "rclone" && config.rclone?.vfs_cache_mode?.toLowerCase() === "full";
 
 	const handleSave = async () => {
 		if (!onUpdate || !hasChanges) return;
@@ -142,6 +170,95 @@ export function Par2RepairConfigSection({
 					expensive.
 				</p>
 			</fieldset>
+
+			<fieldset className="fieldset">
+				<legend className="fieldset-legend">When a Read Fails</legend>
+				<select
+					className="select"
+					value={data.read_failure_action ?? "default"}
+					disabled={isReadOnly}
+					onChange={(e) => handleChange("read_failure_action", e.target.value as ReadFailureAction)}
+				>
+					<option value="default">Default: fill small gaps, repair in the background</option>
+					<option value="replace">Replace: fetch a new release</option>
+					<option value="repair_first">Repair first: fix it before the player gets there</option>
+				</select>
+				<p className="label whitespace-normal">
+					{readFailureDescriptions[data.read_failure_action ?? "default"]}
+				</p>
+			</fieldset>
+
+			{repairFirst && (
+				<>
+					{!(data.enabled ?? false) && (
+						<div className="alert alert-warning">
+							<span className="text-sm">
+								PAR2 repair is off above, so this will always fetch a new release.
+							</span>
+						</div>
+					)}
+					{!rcloneFullCache && (
+						<div className="alert alert-warning">
+							<span className="text-sm">
+								Repair first needs the built-in rclone mount with VFS cache mode set to full.
+								Without it there's no way to get ahead of the player, so this will always fetch a
+								new release.
+							</span>
+						</div>
+					)}
+					{rcloneFullCache && readAheadMb !== null && minLeadMb > readAheadMb && (
+						<div className="alert alert-warning">
+							<span className="text-sm">
+								Minimum lead is more than your rclone read-ahead ({config.rclone?.vfs_read_ahead}),
+								so a repair will never start and this will always fetch a new release. Lower it or
+								raise the read-ahead.
+							</span>
+						</div>
+					)}
+					<div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+						<fieldset className="fieldset">
+							<legend className="fieldset-legend">Minimum Lead (MB)</legend>
+							<input
+								type="number"
+								min={1}
+								className="input"
+								value={minLeadMb}
+								disabled={isReadOnly}
+								onChange={(e) =>
+									handleChange("read_failure_min_lead_mb", Number.parseInt(e.target.value, 10) || 0)
+								}
+							/>
+							<p className="label whitespace-normal">
+								Only repair when the bad data is at least this far past where the stream started.
+								Closer than that, a new release is fetched instead. 1024 MB is about 19 minutes of a
+								7 Mbps episode, or 5 minutes of 25 Mbps 4K. Partly cached files may be replaced even
+								when there was time to repair.
+							</p>
+						</fieldset>
+						<fieldset className="fieldset">
+							<legend className="fieldset-legend">Maximum Repair Wait (seconds)</legend>
+							<input
+								type="number"
+								min={1}
+								className="input"
+								value={data.read_failure_max_wait_seconds ?? 300}
+								disabled={isReadOnly}
+								onChange={(e) =>
+									handleChange(
+										"read_failure_max_wait_seconds",
+										Number.parseInt(e.target.value, 10) || 0,
+									)
+								}
+							/>
+							<p className="label whitespace-normal">
+								If the repair isn't finished by then, it's stopped and a new release is fetched. If
+								the player has caught up, it buffers for up to this long, and some players may give
+								up sooner.
+							</p>
+						</fieldset>
+					</div>
+				</>
+			)}
 
 			<div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
 				<fieldset className="fieldset sm:col-span-2">

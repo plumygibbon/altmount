@@ -111,6 +111,9 @@ func (h *webdavMethods) handleOptions(w http.ResponseWriter, r *http.Request) {
 
 func (h *webdavMethods) handleGet(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	if strings.HasPrefix(r.UserAgent(), "rclone/") {
+		ctx = nzbfilesystem.WithRcloneClient(ctx)
+	}
 	reqPath, status, err := propfind.StripPrefix(r.URL.Path, h.prefix)
 	if err != nil {
 		http.Error(w, "Not Found", status)

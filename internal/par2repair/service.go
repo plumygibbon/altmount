@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,6 +61,7 @@ type JobStore interface {
 	AppendDeadSegment(ctx context.Context, id int64, messageID string) error
 	EnqueueNzb(ctx context.Context, nzbPath string, failingSegmentID string) (bool, error)
 	ResetRunning(ctx context.Context) error
+	List(ctx context.Context, limit int) ([]*database.Par2RepairJob, error)
 }
 
 // ImportResumer returns an import parked pending a repair to the normal queue,
@@ -838,4 +840,43 @@ func metaArticleDate(fm *metapb.FileMetadata) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(fm.GetReleaseDate(), 0)
+}
+
+// activeJobListLimit bounds the scan for a file's job. Only queued and running
+// jobs keep a row, so this is far more than will ever be present.
+const activeJobListLimit = 500
+
+func (s *Service) activeJobFor(ctx context.Context, filePath string) (*database.Par2RepairJob, error) {
+	jobs, err := s.repo.List(ctx, activeJobListLimit)
+	if err != nil {
+		return nil, err
+	}
+	want := strings.TrimPrefix(filePath, "/")
+	for _, job := range jobs {
+		if job.Status != database.Par2RepairStatusPending && job.Status != database.Par2RepairStatusRunning {
+			continue
+		}
+		if slices.ContainsFunc(job.Members(), func(m string) bool { return strings.TrimPrefix(m, "/") == want }) {
+			return job, nil
+		}
+	}
+	return nil, nil
+}
+
+// RepairActive reports whether a repair covering filePath is queued or running.
+func (s *Service) RepairActive(ctx context.Context, filePath string) (bool, error) {
+	job, err := s.activeJobFor(ctx, filePath)
+	return job != nil, err
+}
+
+// CancelRepair stops the repair covering filePath, if there is one.
+func (s *Service) CancelRepair(ctx context.Context, filePath string) error {
+	job, err := s.activeJobFor(ctx, filePath)
+	if err != nil || job == nil {
+		return err
+	}
+	if err := s.Cancel(ctx, job.ID); err != nil && !errors.Is(err, ErrJobNotFound) {
+		return err
+	}
+	return nil
 }

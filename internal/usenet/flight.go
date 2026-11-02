@@ -49,6 +49,9 @@ type articleWriter struct {
 	attempt  int
 	buf      []byte
 	received atomic.Int64 // bytes written so far, readable off the writing goroutine
+	// verifyFirst holds this attempt's bytes back until finish, so a body that
+	// fails its CRC never reaches the reader.
+	verifyFirst bool
 }
 
 // attemptWriter starts a new fetch attempt. Only the newest attempt can
@@ -80,7 +83,9 @@ func (a *articleBuf) liveLocked(w *articleWriter) bool {
 func (w *articleWriter) Write(p []byte) (int, error) {
 	w.buf = append(w.buf, p...)
 	w.received.Store(int64(len(w.buf)))
-	w.a.publish(w)
+	if !w.verifyFirst {
+		w.a.publish(w)
+	}
 	return len(p), nil
 }
 
