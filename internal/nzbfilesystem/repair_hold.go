@@ -2,6 +2,7 @@ package nzbfilesystem
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"path"
 	"strings"
@@ -74,6 +75,7 @@ type repairHolds struct {
 
 // fileHold is the repair a file's readers are waiting on.
 type fileHold struct {
+	started  time.Time
 	deadline time.Time
 	segments map[string]bool // every article waiting on this repair
 	// late lists articles that failed after the repair had started, which it
@@ -169,8 +171,8 @@ func (h *repairHolds) handle(ctx context.Context, r failedRead) bool {
 
 	if reason := h.holdRefusal(cfg, r); reason != "" {
 		slog.InfoContext(ctx, "Replacing file instead of repairing after a read failure",
-			"file", r.name, "segment_id", r.segmentID, "reason", reason)
-		h.replace(r)
+			"file", r.name, "segment_id", r.segmentID, "reason", reason, "cause", r.cause)
+		h.replace(r, reason)
 		return false
 	}
 
@@ -187,12 +189,13 @@ func (h *repairHolds) handle(ctx context.Context, r failedRead) bool {
 		if lead < minLead {
 			h.mu.Unlock()
 			slog.InfoContext(ctx, "Replacing file: not enough lead to repair before the player arrives",
-				"file", r.name, "segment_id", r.segmentID, "lead_bytes", lead, "min_lead_bytes", minLead)
-			h.replace(r)
+				"file", r.name, "segment_id", r.segmentID, "lead_bytes", lead, "min_lead_bytes", minLead, "cause", r.cause)
+			h.replace(r, fmt.Sprintf("not enough lead (%d MiB, need %d MiB)", lead>>20, minLead>>20))
 			return false
 		}
 		wait := cfg.Par2Repair.EffectiveReadFailureMaxWait()
 		hold = &fileHold{
+			started:  h.now(),
 			deadline: h.now().Add(wait),
 			segments: map[string]bool{r.segmentID: true},
 			done:     make(chan struct{}),
@@ -200,7 +203,7 @@ func (h *repairHolds) handle(ctx context.Context, r failedRead) bool {
 		h.active[r.name] = hold
 		h.mu.Unlock()
 		slog.InfoContext(ctx, "Holding read while PAR2 repairs a bad article",
-			"file", r.name, "segment_id", r.segmentID, "lead_bytes", lead, "max_wait", wait)
+			"file", r.name, "segment_id", r.segmentID, "offset", r.offset, "lead_bytes", lead, "max_wait", wait, "cause", r.cause)
 		h.repairs.Enqueue(context.WithoutCancel(ctx), r.name, r.segmentID)
 		go h.run(r, hold)
 	} else {
@@ -259,12 +262,14 @@ func (h *repairHolds) run(r failedRead, hold *fileHold) {
 		}
 		h.mu.Unlock()
 		if missing == 0 {
-			slog.InfoContext(ctx, "PAR2 repair finished in time, releasing held reads", "file", r.name)
+			slog.InfoContext(ctx, "PAR2 repair finished in time, releasing held reads",
+				"file", r.name, "held_for", h.now().Sub(hold.started))
 			return
 		}
 
 		if !h.now().Before(hold.deadline) {
-			slog.WarnContext(ctx, "PAR2 repair ran out of time, cancelling it and replacing the file", "file", r.name)
+			slog.WarnContext(ctx, "PAR2 repair ran out of time, cancelling it and replacing the file",
+				"file", r.name, "held_for", h.now().Sub(hold.started))
 			cancelCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			if err := h.repairs.CancelRepair(cancelCtx, r.name); err != nil {
 				// Cancelling marks the job first, so its outcome is ignored even
@@ -277,7 +282,7 @@ func (h *repairHolds) run(r failedRead, hold *fileHold) {
 				slog.InfoContext(ctx, "PAR2 repair finished as it was being cancelled, keeping the file", "file", r.name)
 				return
 			}
-			h.replace(r)
+			h.replace(r, "PAR2 repair ran out of time")
 			return
 		}
 
@@ -299,10 +304,13 @@ func (h *repairHolds) run(r failedRead, hold *fileHold) {
 			continue
 		}
 		if h.allPatched(hold) {
+			slog.InfoContext(ctx, "PAR2 repair finished in time, releasing held reads",
+				"file", r.name, "held_for", h.now().Sub(hold.started))
 			return
 		}
-		slog.WarnContext(ctx, "PAR2 repair could not rebuild the file, replacing it", "file", r.name)
-		h.replace(r)
+		slog.WarnContext(ctx, "PAR2 repair could not rebuild the file, replacing it",
+			"file", r.name, "held_for", h.now().Sub(hold.started))
+		h.replace(r, "PAR2 repair could not rebuild the file")
 		return
 	}
 }
@@ -339,17 +347,21 @@ func (h *repairHolds) hasPatch(segmentID string) bool {
 
 // replace hands the file to the health worker to fetch a new release. It spends
 // the file's repair debounce token, so readers failing on the same file don't
-// repeat this through the normal failure path.
-func (h *repairHolds) replace(r failedRead) {
+// repeat this through the normal failure path. reason is kept on the health
+// record so the decision can be reviewed after the logs have rotated.
+func (h *repairHolds) replace(r failedRead, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	if !h.coalescer.ShouldTrigger(r.name) {
+		slog.DebugContext(ctx, "File replacement already triggered", "file", r.name, "reason", reason)
 		return
 	}
+	slog.InfoContext(ctx, "Handing file over for replacement",
+		"file", r.name, "segment_id", r.segmentID, "reason", reason, "cause", r.cause)
 	h.mu.Lock()
 	h.replaced[r.name] = h.now()
 	h.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	cfg := h.config()
 	if err := h.metadata.UpdateFileStatus(r.name, metapb.FileStatus_FILE_STATUS_CORRUPTED); err != nil {
 		slog.WarnContext(ctx, "Failed to mark file corrupted for replacement", "file", r.name, "error", err)
@@ -368,7 +380,7 @@ func (h *repairHolds) replace(r failedRead) {
 		}
 	}
 
-	cause := r.cause
+	cause := fmt.Sprintf("read failure, %s: %s", reason, r.cause)
 	var sourceNzb *string
 	if r.sourceNzbPath != "" {
 		sourceNzb = &r.sourceNzbPath

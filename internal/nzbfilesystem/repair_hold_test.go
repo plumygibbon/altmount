@@ -81,6 +81,7 @@ type fakeHoldHealth struct {
 	mu       sync.Mutex
 	library  string
 	statuses []database.HealthStatus
+	messages []string
 }
 
 func (f *fakeHoldHealth) GetFileHealth(context.Context, string) (*database.FileHealth, error) {
@@ -90,11 +91,23 @@ func (f *fakeHoldHealth) GetFileHealth(context.Context, string) (*database.FileH
 	return &database.FileHealth{LibraryPath: &f.library}, nil
 }
 
-func (f *fakeHoldHealth) UpdateFileHealthScheduled(_ context.Context, _ string, status database.HealthStatus, _ *string, _ *string, _ *string, _ bool, _ time.Time) error {
+func (f *fakeHoldHealth) UpdateFileHealthScheduled(_ context.Context, _ string, status database.HealthStatus, errorMessage *string, _ *string, _ *string, _ bool, _ time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.statuses = append(f.statuses, status)
+	if errorMessage != nil {
+		f.messages = append(f.messages, *errorMessage)
+	}
 	return nil
+}
+
+func (f *fakeHoldHealth) lastMessage() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.messages) == 0 {
+		return ""
+	}
+	return f.messages[len(f.messages)-1]
 }
 
 func (f *fakeHoldHealth) replacements() int {
@@ -256,6 +269,10 @@ func TestHoldTimesOutThenCancelsBeforeReplacing(t *testing.T) {
 	}
 	if n := f.health.replacements(); n != 1 {
 		t.Fatalf("replacements = %d, want 1", n)
+	}
+	// The health record keeps why, for review after the logs rotate.
+	if got, want := f.health.lastMessage(), "read failure, PAR2 repair ran out of time: boom"; got != want {
+		t.Fatalf("health message = %q, want %q", got, want)
 	}
 }
 
